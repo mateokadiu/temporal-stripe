@@ -1,0 +1,43 @@
+{
+  "name": "@temporal-stripe/webhook",
+  "version": "0.0.0",
+  "description": "Tiny helpers to filter reauthorization-initiated payment_intent.canceled events in Stripe webhook handlers.",
+  "license": "MIT",
+  "author": "Mateo Kadiu",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mateokadiu/temporal-stripe.git",
+    "directory": "packages/webhook"
+  },
+  "keywords": ["stripe", "webhook", "payment-intents", "reauthorization"],
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "echo 'lint TBD'",
+    "clean": "rm -rf dist"
+  },
+  "peerDependencies": {
+    "stripe": "^17.0.0 || ^18.0.0 || ^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "stripe": "^19.0.0",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "name": "temporal-stripe",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Temporal workflows for the Stripe Connect lifecycle: reauthorization, capture, refund, revision, webhook filtering.",
+  "license": "MIT",
+  "author": "Mateo Kadiu",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mateokadiu/temporal-stripe.git"
+  },
+  "homepage": "https://github.com/mateokadiu/temporal-stripe#readme",
+  "bugs": "https://github.com/mateokadiu/temporal-stripe/issues",
+  "packageManager": "pnpm@9.12.0",
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "test": "turbo run test",
+    "typecheck": "turbo run typecheck",
+    "lint": "turbo run lint",
+    "clean": "turbo run clean && rm -rf node_modules"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "turbo": "^2.3.0",
+    "typescript": "^5.7.2"
+  }
+}

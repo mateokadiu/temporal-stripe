@@ -1,0 +1,27 @@
+{
+  "name": "example-basic",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "worker": "tsx worker.ts",
+    "client": "tsx client.ts",
+    "build": "echo 'example — no build'",
+    "test": "echo 'example — no tests'",
+    "typecheck": "tsc --noEmit",
+    "lint": "echo 'lint TBD'",
+    "clean": "echo 'nothing to clean'"
+  },
+  "dependencies": {
+    "@temporal-stripe/core": "workspace:*",
+    "@temporal-stripe/webhook": "workspace:*",
+    "@temporalio/client": "^1.11.7",
+    "@temporalio/worker": "^1.11.7",
+    "stripe": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
