@@ -79,14 +79,17 @@ export async function stripeOrderWorkflow(args: StripeOrderArgs): Promise<Workfl
       sleep(timerMs).then(() => 'timer' as const),
     ]);
 
+    // Priority order:
+    //   1. cancel — explicit kill wins over everything
+    //   2. revise — re-amount BEFORE a possibly-queued capture so the user
+    //               captures at the new amount, not the old
+    //   3. admin reauth — same reasoning: run a queued non-terminal reauth
+    //                     before a terminal capture
+    //   4. capture — terminal action
+    //   5. timer — implicit reauth deadline reached
     if (pending.cancel) {
       state = await runCancel(state, pending.cancel);
       pending.cancel = undefined;
-      break;
-    }
-    if (pending.capture) {
-      state = await runCapture(state, pending.capture);
-      pending.capture = undefined;
       break;
     }
     if (pending.revise) {
@@ -94,9 +97,18 @@ export async function stripeOrderWorkflow(args: StripeOrderArgs): Promise<Workfl
       pending.revise = undefined;
       continue;
     }
-    if (pending.reauthAdmin || settled === 'timer') {
+    if (pending.reauthAdmin) {
       state = await runReauthorize(state);
       pending.reauthAdmin = false;
+      continue;
+    }
+    if (pending.capture) {
+      state = await runCapture(state, pending.capture);
+      pending.capture = undefined;
+      break;
+    }
+    if (settled === 'timer') {
+      state = await runReauthorize(state);
       continue;
     }
   }
