@@ -10,7 +10,7 @@
    npm token create --read-only=false --type=automation
    ```
 3. **Add `NPM_TOKEN` to GitHub.** Repo → Settings → Secrets and variables → Actions → New repository secret.
-4. **Push to GitHub.** Create the repo (`mateokadiu/temporal-stripe`) and push the `main` branch. The Release workflow fires automatically.
+4. **Trigger the release** manually: Actions tab → Release → Run workflow. Picks up conventional commits since the last tag and decides the bump.
 
 ## Commit conventions
 

@@ -1,8 +1,11 @@
 name: Release
 
+# Manual trigger only — auto-running on every push to main was firing the
+# release pass against a repo that doesn't yet have NPM_TOKEN configured.
+# Once the token is in repo secrets, "Run workflow" in the Actions tab
+# does an automated release based on conventional commits since last tag.
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: write
