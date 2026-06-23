@@ -12,22 +12,8 @@ module.exports = {
   plugins: [
     '@semantic-release/commit-analyzer',
     '@semantic-release/release-notes-generator',
-    [
-      '@semantic-release/changelog',
-      { changelogFile: 'CHANGELOG.md' },
-    ],
-    [
-      'semantic-release-monorepo',
-      {
-        // Apply per-package; the GH Actions release workflow runs sr per package.
-      },
-    ],
-    [
-      '@semantic-release/npm',
-      {
-        // pkgRoot is set per-package in the GH workflow.
-      },
-    ],
+    ['@semantic-release/changelog', { changelogFile: 'CHANGELOG.md' }],
+    '@semantic-release/npm',
     [
       '@semantic-release/git',
       {
