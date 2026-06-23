@@ -37,15 +37,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          npx -p semantic-release -p @semantic-release/changelog -p @semantic-release/git -p semantic-release-monorepo \
-            semantic-release --extends ../../release.config.cjs
+        run: pnpm exec semantic-release --extends ../../release.config.cjs
 
       - name: Release @temporal-stripe/webhook
         working-directory: packages/webhook
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          npx -p semantic-release -p @semantic-release/changelog -p @semantic-release/git -p semantic-release-monorepo \
-            semantic-release --extends ../../release.config.cjs
+        run: pnpm exec semantic-release --extends ../../release.config.cjs
