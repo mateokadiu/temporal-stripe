@@ -1,4 +1,4 @@
-import type { CancelReason, WorkflowState } from '../state.js';
+import type { CancelReason, RefundWorkflowState, WorkflowState } from '../state.js';
 
 export interface ReauthorizeInput {
   orderId: string;
@@ -48,11 +48,45 @@ export interface RefundInput {
   amountCents?: number;
   reverseTransfer?: boolean;
   refundApplicationFee?: boolean;
+  reason?: 'duplicate' | 'fraudulent' | 'requested_by_customer';
+  metadata?: Record<string, string>;
 }
 
 export interface RefundResult {
   refundId: string;
   amountCents: number;
+  /** Stripe-confirmed refund status — usually `succeeded` immediately for card refunds. */
+  status?: string;
+}
+
+/**
+ * Refund-workflow activity contract. Kept separate from `StripeOrderActivities`
+ * because the lifecycle is genuinely independent — a refund workflow only ever
+ * lives once the parent order is captured, and it can outlive that workflow by
+ * weeks (chargebacks). Splitting the interfaces also lets consumers wire only
+ * what they need on each worker.
+ */
+export interface StripeRefundActivities {
+  refundPaymentIntent(input: RefundInput): Promise<RefundResult>;
+  /** Persist the refund-workflow state to the consumer's DB after each transition. */
+  persistRefundContext(ctx: RefundWorkflowState): Promise<void>;
+  /** Optional notification hooks — workflow doesn't care about return values. */
+  onRefunded(
+    ctx: RefundWorkflowState,
+    refund: { id: string; amountCents: number },
+  ): Promise<void>;
+  onDisputeOpened(
+    ctx: RefundWorkflowState,
+    dispute: { id: string; amountCents: number },
+  ): Promise<void>;
+  onDisputeClosed(
+    ctx: RefundWorkflowState,
+    dispute: { id: string; status: string },
+  ): Promise<void>;
+  onRefundFailure(
+    ctx: RefundWorkflowState,
+    err: { name: string; message: string },
+  ): Promise<void>;
 }
 
 /**
