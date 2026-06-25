@@ -1,3 +1,9 @@
 export * from './interface.js';
-export { makeStripeActivities } from './make-stripe-activities.js';
-export type { MakeStripeActivitiesOptions } from './make-stripe-activities.js';
+export {
+  makeStripeActivities,
+  makeStripeRefundActivities,
+} from './make-stripe-activities.js';
+export type {
+  MakeStripeActivitiesOptions,
+  MakeStripeRefundActivitiesOptions,
+} from './make-stripe-activities.js';

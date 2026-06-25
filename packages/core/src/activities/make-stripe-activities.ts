@@ -12,6 +12,7 @@ import type {
   ReviseInput,
   ReviseResult,
   StripeOrderActivities,
+  StripeRefundActivities,
 } from './interface.js';
 
 export interface MakeStripeActivitiesOptions {
@@ -171,12 +172,46 @@ export function makeStripeActivities(
           ...(input.refundApplicationFee !== undefined
             ? { refund_application_fee: input.refundApplicationFee }
             : {}),
+          ...(input.reason !== undefined ? { reason: input.reason } : {}),
+          ...(input.metadata !== undefined ? { metadata: input.metadata } : {}),
         },
         { stripeAccount: input.stripeAccountId },
       );
-      return { refundId: refund.id, amountCents: refund.amount };
+      return { refundId: refund.id, amountCents: refund.amount, status: refund.status ?? undefined };
     },
   };
 
   return activities;
+}
+
+export interface MakeStripeRefundActivitiesOptions {
+  persistRefundContext: StripeRefundActivities['persistRefundContext'];
+  onRefunded?: StripeRefundActivities['onRefunded'];
+  onDisputeOpened?: StripeRefundActivities['onDisputeOpened'];
+  onDisputeClosed?: StripeRefundActivities['onDisputeClosed'];
+  onRefundFailure?: StripeRefundActivities['onRefundFailure'];
+}
+
+/**
+ * Companion factory for the refund workflow. Re-uses the same Stripe SDK
+ * surface as `makeStripeActivities` so consumers can wire one Stripe instance
+ * and split activities across two workers if they like.
+ */
+export function makeStripeRefundActivities(
+  stripe: Stripe,
+  opts: MakeStripeRefundActivitiesOptions,
+): StripeRefundActivities {
+  const orderLike = makeStripeActivities(stripe, {
+    persistContext: async () => {
+      /* unused on the refund side */
+    },
+  });
+  return {
+    refundPaymentIntent: orderLike.refundPaymentIntent,
+    persistRefundContext: opts.persistRefundContext,
+    onRefunded: opts.onRefunded ?? noopHook,
+    onDisputeOpened: opts.onDisputeOpened ?? noopHook,
+    onDisputeClosed: opts.onDisputeClosed ?? noopHook,
+    onRefundFailure: opts.onRefundFailure ?? noopHook,
+  };
 }

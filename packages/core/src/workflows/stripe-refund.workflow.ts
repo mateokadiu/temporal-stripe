@@ -86,12 +86,65 @@ export async function stripeRefundWorkflow(args: StripeRefundArgs): Promise<Refu
       continue;
     }
     if (pending.refund.length > 0) {
-      pending.refund.shift();
+      const next = pending.refund.shift()!;
+      state = await runRefund(state, next);
       continue;
     }
   }
 
   return state;
+}
+
+async function runRefund(
+  state: RefundWorkflowState,
+  input: RefundRequestSignalInput,
+): Promise<RefundWorkflowState> {
+  // Default to refunding the entire remaining balance — this is the common
+  // case for "cancel after capture" flows.
+  const remaining = state.capturedAmountCents - state.refundedAmountCents;
+  const amountCents = input.amountCents ?? remaining;
+  state = { ...state, status: 'refunding' };
+  try {
+    const result = await activities.refundPaymentIntent({
+      paymentIntentId: state.paymentIntentId,
+      stripeAccountId: state.stripeAccountId,
+      amountCents,
+      reverseTransfer: input.reverseTransfer ?? state.reverseTransfer,
+      refundApplicationFee: input.refundApplicationFee ?? state.refundApplicationFee,
+      reason: input.reason,
+      metadata: {
+        ...state.metadata,
+        ...(input.notes ? { refundNotes: input.notes } : {}),
+      },
+    });
+    const next: RefundWorkflowState = {
+      ...state,
+      refundedAmountCents: state.refundedAmountCents + result.amountCents,
+      refunds: [
+        ...state.refunds,
+        {
+          refundId: result.refundId,
+          amountCents: result.amountCents,
+          at: Date.now(),
+          reason: input.reason,
+        },
+      ],
+      status: 'fully_refunded',
+    };
+    await activities.persistRefundContext(next);
+    await activities.onRefunded(next, { id: result.refundId, amountCents: result.amountCents });
+    return next;
+  } catch (err) {
+    const failed: RefundWorkflowState = { ...state, status: 'failed' };
+    await activities.persistRefundContext(failed);
+    await activities.onRefundFailure(failed, errorPayload(err));
+    return failed;
+  }
+}
+
+function errorPayload(err: unknown): { name: string; message: string } {
+  if (err instanceof Error) return { name: err.name, message: err.message };
+  return { name: 'UnknownError', message: String(err) };
 }
 
 function isTerminal(state: RefundWorkflowState): boolean {

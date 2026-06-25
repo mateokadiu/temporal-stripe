@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { stripeRefundWorkflow } from '../src/workflows/stripe-refund.workflow.js';
 import {
+  refundRequestSignal,
   refundStateQuery,
 } from '../src/workflows/refund-signals.js';
 import type { StripeRefundArgs, RefundWorkflowState } from '../src/state.js';
@@ -20,6 +21,13 @@ interface RefundCallLog {
   onDisputeOpened: number;
   onDisputeClosed: number;
   onRefundFailure: number;
+  lastInput?: {
+    amountCents?: number;
+    reverseTransfer?: boolean;
+    refundApplicationFee?: boolean;
+    reason?: string;
+    metadata?: Record<string, string>;
+  };
 }
 
 function makeStubRefundActivities(opts: { refundOk?: boolean } = {}): {
@@ -40,6 +48,13 @@ function makeStubRefundActivities(opts: { refundOk?: boolean } = {}): {
   const activities: StripeRefundActivities = {
     async refundPaymentIntent(input) {
       log.refund += 1;
+      log.lastInput = {
+        amountCents: input.amountCents,
+        reverseTransfer: input.reverseTransfer,
+        refundApplicationFee: input.refundApplicationFee,
+        reason: input.reason,
+        metadata: input.metadata,
+      };
       if (!refundOk) throw new Error('refund failure');
       return { refundId: `rf_${log.refund}`, amountCents: input.amountCents ?? 0, status: 'succeeded' };
     },
@@ -83,6 +98,58 @@ describe('stripeRefundWorkflow (scaffold)', () => {
 
   afterAll(async () => {
     await env?.teardown();
+  });
+
+  it('full refund passes reverse_transfer + refund_application_fee through to the activity', async () => {
+    const { activities, log } = makeStubRefundActivities();
+    const worker = await Worker.create({
+      connection: env.nativeConnection,
+      taskQueue: 'test-refund-tq',
+      workflowsPath,
+      activities,
+    });
+
+    const result = await worker.runUntil(async () => {
+      const handle = await env.client.workflow.start(stripeRefundWorkflow, {
+        taskQueue: 'test-refund-tq',
+        workflowId: `wf-refund-full-${Math.floor(Math.random() * 1e9)}`,
+        args: [refundArgs({ refundApplicationFee: true, reverseTransfer: true })],
+      });
+      await handle.signal(refundRequestSignal, { reason: 'requested_by_customer', notes: 'ops' });
+      return await handle.result();
+    });
+
+    expect(log.refund).toBe(1);
+    expect(log.onRefunded).toBe(1);
+    expect(result.status).toBe('fully_refunded');
+    expect(result.refundedAmountCents).toBe(5000);
+    expect(log.lastInput?.reverseTransfer).toBe(true);
+    expect(log.lastInput?.refundApplicationFee).toBe(true);
+    expect(log.lastInput?.reason).toBe('requested_by_customer');
+    expect(log.lastInput?.metadata?.refundNotes).toBe('ops');
+  });
+
+  it('refund failure surfaces onRefundFailure and lands in status=failed', async () => {
+    const { activities, log } = makeStubRefundActivities({ refundOk: false });
+    const worker = await Worker.create({
+      connection: env.nativeConnection,
+      taskQueue: 'test-refund-tq',
+      workflowsPath,
+      activities,
+    });
+
+    const result = await worker.runUntil(async () => {
+      const handle = await env.client.workflow.start(stripeRefundWorkflow, {
+        taskQueue: 'test-refund-tq',
+        workflowId: `wf-refund-fail-${Math.floor(Math.random() * 1e9)}`,
+        args: [refundArgs()],
+      });
+      await handle.signal(refundRequestSignal, {});
+      return await handle.result();
+    });
+
+    expect(result.status).toBe('failed');
+    expect(log.onRefundFailure).toBe(1);
   });
 
   it('starts in idle status with refundedAmountCents at 0', async () => {
