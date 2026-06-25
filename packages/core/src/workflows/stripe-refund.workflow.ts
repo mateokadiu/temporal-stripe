@@ -103,6 +103,20 @@ async function runRefund(
   // case for "cancel after capture" flows.
   const remaining = state.capturedAmountCents - state.refundedAmountCents;
   const amountCents = input.amountCents ?? remaining;
+
+  // Guard against overflow — Stripe would reject it anyway, but failing fast
+  // gives the consumer a clean state transition instead of a cryptic API error.
+  if (amountCents <= 0 || amountCents > remaining) {
+    const failed: RefundWorkflowState = { ...state, status: 'failed' };
+    await activities.persistRefundContext(failed);
+    await activities.onRefundFailure(failed, {
+      name: 'StripeOrderError',
+      message: `refund: amountCents ${amountCents} out of range (remaining: ${remaining})`,
+    });
+    return failed;
+  }
+
+  const previousStatus = state.status;
   state = { ...state, status: 'refunding' };
   try {
     const result = await activities.refundPaymentIntent({
@@ -117,9 +131,12 @@ async function runRefund(
         ...(input.notes ? { refundNotes: input.notes } : {}),
       },
     });
+    const refundedAmountCents = state.refundedAmountCents + result.amountCents;
+    const nextStatus =
+      refundedAmountCents >= state.capturedAmountCents ? 'fully_refunded' : 'partially_refunded';
     const next: RefundWorkflowState = {
       ...state,
-      refundedAmountCents: state.refundedAmountCents + result.amountCents,
+      refundedAmountCents,
       refunds: [
         ...state.refunds,
         {
@@ -129,12 +146,16 @@ async function runRefund(
           reason: input.reason,
         },
       ],
-      status: 'fully_refunded',
+      status: nextStatus,
     };
     await activities.persistRefundContext(next);
     await activities.onRefunded(next, { id: result.refundId, amountCents: result.amountCents });
     return next;
   } catch (err) {
+    // Roll back the transient `refunding` status if we want to allow retries,
+    // but for a failed Stripe call we land in `failed`. Consumer can decide to
+    // restart the workflow.
+    void previousStatus;
     const failed: RefundWorkflowState = { ...state, status: 'failed' };
     await activities.persistRefundContext(failed);
     await activities.onRefundFailure(failed, errorPayload(err));

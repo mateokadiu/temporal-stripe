@@ -129,6 +129,61 @@ describe('stripeRefundWorkflow (scaffold)', () => {
     expect(log.lastInput?.metadata?.refundNotes).toBe('ops');
   });
 
+  it('partial refunds accumulate refundedAmountCents and leave status=partially_refunded', async () => {
+    const { activities, log } = makeStubRefundActivities();
+    const worker = await Worker.create({
+      connection: env.nativeConnection,
+      taskQueue: 'test-refund-tq',
+      workflowsPath,
+      activities,
+    });
+
+    const result = await worker.runUntil(async () => {
+      const handle = await env.client.workflow.start(stripeRefundWorkflow, {
+        taskQueue: 'test-refund-tq',
+        workflowId: `wf-refund-partial-${Math.floor(Math.random() * 1e9)}`,
+        args: [refundArgs({ capturedAmountCents: 5000 })],
+      });
+      await handle.signal(refundRequestSignal, { amountCents: 1000 });
+      // Query once we know the first refund's been written. We can't peek
+      // mid-workflow easily; just rely on subsequent signals racing fine.
+      await handle.signal(refundRequestSignal, { amountCents: 1500 });
+      // Final partial that completes the refund.
+      await handle.signal(refundRequestSignal, { amountCents: 2500 });
+      return await handle.result();
+    });
+
+    expect(log.refund).toBe(3);
+    expect(result.refundedAmountCents).toBe(5000);
+    expect(result.refunds).toHaveLength(3);
+    expect(result.refunds.map((r) => r.amountCents)).toEqual([1000, 1500, 2500]);
+    expect(result.status).toBe('fully_refunded');
+  });
+
+  it('over-refund (amountCents > remaining) lands in failed and skips the Stripe call', async () => {
+    const { activities, log } = makeStubRefundActivities();
+    const worker = await Worker.create({
+      connection: env.nativeConnection,
+      taskQueue: 'test-refund-tq',
+      workflowsPath,
+      activities,
+    });
+
+    const result = await worker.runUntil(async () => {
+      const handle = await env.client.workflow.start(stripeRefundWorkflow, {
+        taskQueue: 'test-refund-tq',
+        workflowId: `wf-refund-over-${Math.floor(Math.random() * 1e9)}`,
+        args: [refundArgs({ capturedAmountCents: 1000 })],
+      });
+      await handle.signal(refundRequestSignal, { amountCents: 9999 });
+      return await handle.result();
+    });
+
+    expect(result.status).toBe('failed');
+    expect(log.refund).toBe(0);
+    expect(log.onRefundFailure).toBe(1);
+  });
+
   it('refund failure surfaces onRefundFailure and lands in status=failed', async () => {
     const { activities, log } = makeStubRefundActivities({ refundOk: false });
     const worker = await Worker.create({
