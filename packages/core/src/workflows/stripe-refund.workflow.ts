@@ -77,22 +77,78 @@ export async function stripeRefundWorkflow(args: StripeRefundArgs): Promise<Refu
     // to short-circuit pending refund requests, since Stripe will refuse to
     // refund a disputed charge.
     if (pending.disputeOpened) {
-      // Wired up in commit 4.
+      state = await runDisputeOpened(state, pending.disputeOpened);
       pending.disputeOpened = undefined;
       continue;
     }
     if (pending.disputeClosed) {
+      state = await runDisputeClosed(state, pending.disputeClosed);
       pending.disputeClosed = undefined;
       continue;
     }
     if (pending.refund.length > 0) {
       const next = pending.refund.shift()!;
+      // Block refund attempts while a dispute is active — Stripe will reject
+      // them and the workflow would unnecessarily land in `failed`.
+      if (state.status === 'disputed') {
+        await activities.onRefundFailure(state, {
+          name: 'StripeOrderError',
+          message: 'refund: cannot refund while a dispute is open',
+        });
+        continue;
+      }
       state = await runRefund(state, next);
       continue;
     }
   }
 
   return state;
+}
+
+async function runDisputeOpened(
+  state: RefundWorkflowState,
+  input: DisputeOpenedSignalInput,
+): Promise<RefundWorkflowState> {
+  const next: RefundWorkflowState = {
+    ...state,
+    status: 'disputed',
+    disputes: [
+      ...state.disputes,
+      {
+        disputeId: input.disputeId,
+        amountCents: input.amountCents,
+        event: 'opened',
+        at: Date.now(),
+      },
+    ],
+  };
+  await activities.persistRefundContext(next);
+  await activities.onDisputeOpened(next, { id: input.disputeId, amountCents: input.amountCents });
+  return next;
+}
+
+async function runDisputeClosed(
+  state: RefundWorkflowState,
+  input: DisputeClosedSignalInput,
+): Promise<RefundWorkflowState> {
+  const lastDispute = state.disputes.findLast?.((d) => d.disputeId === input.disputeId);
+  const next: RefundWorkflowState = {
+    ...state,
+    status: 'dispute_closed',
+    disputes: [
+      ...state.disputes,
+      {
+        disputeId: input.disputeId,
+        amountCents: lastDispute?.amountCents ?? 0,
+        event: 'closed',
+        closedStatus: input.status,
+        at: Date.now(),
+      },
+    ],
+  };
+  await activities.persistRefundContext(next);
+  await activities.onDisputeClosed(next, { id: input.disputeId, status: input.status });
+  return next;
 }
 
 async function runRefund(

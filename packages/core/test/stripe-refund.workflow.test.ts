@@ -5,6 +5,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { stripeRefundWorkflow } from '../src/workflows/stripe-refund.workflow.js';
 import {
+  disputeClosedSignal,
+  disputeOpenedSignal,
   refundRequestSignal,
   refundStateQuery,
 } from '../src/workflows/refund-signals.js';
@@ -182,6 +184,105 @@ describe('stripeRefundWorkflow (scaffold)', () => {
     expect(result.status).toBe('failed');
     expect(log.refund).toBe(0);
     expect(log.onRefundFailure).toBe(1);
+  });
+
+  it('disputeOpened sets status=disputed and queues the dispute log', async () => {
+    const { activities, log } = makeStubRefundActivities();
+    const worker = await Worker.create({
+      connection: env.nativeConnection,
+      taskQueue: 'test-refund-tq',
+      workflowsPath,
+      activities,
+    });
+
+    await worker.runUntil(async () => {
+      const handle = await env.client.workflow.start(stripeRefundWorkflow, {
+        taskQueue: 'test-refund-tq',
+        workflowId: `wf-refund-dispute-${Math.floor(Math.random() * 1e9)}`,
+        args: [refundArgs({ capturedAmountCents: 5000 })],
+      });
+      await handle.signal(disputeOpenedSignal, {
+        disputeId: 'dp_1',
+        amountCents: 5000,
+        reason: 'fraudulent',
+      });
+      // Wait for the workflow tick to process the dispute. We can't easily
+      // race the condition; signal then poll the query.
+      let snap = await handle.query(refundStateQuery);
+      // give the worker a tick to drain the signal
+      for (let i = 0; snap.status !== 'disputed' && i < 50; i++) {
+        await new Promise((r) => setTimeout(r, 20));
+        snap = await handle.query(refundStateQuery);
+      }
+      expect(snap.status).toBe('disputed');
+      expect(snap.disputes).toHaveLength(1);
+      expect(snap.disputes[0]?.disputeId).toBe('dp_1');
+      expect(log.onDisputeOpened).toBe(1);
+      await handle.terminate();
+    });
+  });
+
+  it('refund signals are blocked while a dispute is open', async () => {
+    const { activities, log } = makeStubRefundActivities();
+    const worker = await Worker.create({
+      connection: env.nativeConnection,
+      taskQueue: 'test-refund-tq',
+      workflowsPath,
+      activities,
+    });
+
+    await worker.runUntil(async () => {
+      const handle = await env.client.workflow.start(stripeRefundWorkflow, {
+        taskQueue: 'test-refund-tq',
+        workflowId: `wf-refund-blocked-${Math.floor(Math.random() * 1e9)}`,
+        args: [refundArgs({ capturedAmountCents: 5000 })],
+      });
+      await handle.signal(disputeOpenedSignal, { disputeId: 'dp_x', amountCents: 5000 });
+      // Wait until status flips
+      let snap = await handle.query(refundStateQuery);
+      for (let i = 0; snap.status !== 'disputed' && i < 50; i++) {
+        await new Promise((r) => setTimeout(r, 20));
+        snap = await handle.query(refundStateQuery);
+      }
+      await handle.signal(refundRequestSignal, { amountCents: 1000 });
+      // give the workflow a moment to process
+      await new Promise((r) => setTimeout(r, 200));
+      expect(log.refund).toBe(0);
+      expect(log.onRefundFailure).toBeGreaterThanOrEqual(1);
+      await handle.terminate();
+    });
+  });
+
+  it('disputeClosed flips status to dispute_closed and records closedStatus', async () => {
+    const { activities, log } = makeStubRefundActivities();
+    const worker = await Worker.create({
+      connection: env.nativeConnection,
+      taskQueue: 'test-refund-tq',
+      workflowsPath,
+      activities,
+    });
+
+    await worker.runUntil(async () => {
+      const handle = await env.client.workflow.start(stripeRefundWorkflow, {
+        taskQueue: 'test-refund-tq',
+        workflowId: `wf-refund-dispute-closed-${Math.floor(Math.random() * 1e9)}`,
+        args: [refundArgs({ capturedAmountCents: 5000 })],
+      });
+      await handle.signal(disputeOpenedSignal, { disputeId: 'dp_y', amountCents: 5000 });
+      await handle.signal(disputeClosedSignal, { disputeId: 'dp_y', status: 'won' });
+      let snap = await handle.query(refundStateQuery);
+      for (let i = 0; snap.status !== 'dispute_closed' && i < 50; i++) {
+        await new Promise((r) => setTimeout(r, 20));
+        snap = await handle.query(refundStateQuery);
+      }
+      expect(snap.status).toBe('dispute_closed');
+      // Two log entries: opened + closed
+      expect(snap.disputes).toHaveLength(2);
+      expect(snap.disputes[1]?.event).toBe('closed');
+      expect(snap.disputes[1]?.closedStatus).toBe('won');
+      expect(log.onDisputeClosed).toBe(1);
+      await handle.terminate();
+    });
   });
 
   it('refund failure surfaces onRefundFailure and lands in status=failed', async () => {
