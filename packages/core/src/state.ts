@@ -18,6 +18,14 @@ export const StripeOrderArgsSchema = z.object({
 // `initialStateFromArgs` applies defaults.
 export type StripeOrderArgs = z.input<typeof StripeOrderArgsSchema>;
 
+export interface CaptureLogEntry {
+  chargeId: string;
+  amountCents: number;
+  /** epoch ms */
+  at: number;
+  isFinal: boolean;
+}
+
 /** Workflow-local mutable state. Persisted via the consumer-provided
  *  `persistContext` activity after every successful state transition. */
 export interface WorkflowState {
@@ -26,7 +34,12 @@ export interface WorkflowState {
   paymentMethodId: string;
   stripeAccountId: string;
   customerId: string;
+  /** Authorized amount on the active PI. */
   amountCents: number;
+  /** Sum of amounts captured so far — accumulates across multicapture slices. */
+  capturedAmountCents: number;
+  /** Audit log of every capture slice the workflow has executed. */
+  captures: CaptureLogEntry[];
   currency: string;
   cardBrand: string;
   authCreatedAt: number;
@@ -138,6 +151,8 @@ export function initialStateFromArgs(args: StripeOrderArgs): WorkflowState {
     stripeAccountId: args.stripeAccountId,
     customerId: args.customerId,
     amountCents: args.initialAmountCents,
+    capturedAmountCents: 0,
+    captures: [],
     currency: args.currency,
     cardBrand: args.initialCardBrand,
     authCreatedAt: args.authCreatedAt,

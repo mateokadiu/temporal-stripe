@@ -5,11 +5,13 @@ import { getReauthTimerMs } from './reauth-timer.js';
 import {
   captureSignal,
   cancelSignal,
+  multicaptureSignal,
   reauthorizeSignal,
   reviseSignal,
   stateQuery,
   type CaptureSignalInput,
   type CancelSignalInput,
+  type MulticaptureSignalInput,
   type ReviseSignalInput,
 } from './signals.js';
 
@@ -28,6 +30,7 @@ interface Pending {
   cancel?: CancelSignalInput;
   revise?: ReviseSignalInput;
   reauthAdmin?: boolean;
+  multicapture: MulticaptureSignalInput[];
 }
 
 /**
@@ -43,7 +46,7 @@ interface Pending {
  */
 export async function stripeOrderWorkflow(args: StripeOrderArgs): Promise<WorkflowState> {
   let state = initialStateFromArgs(args);
-  const pending: Pending = {};
+  const pending: Pending = { multicapture: [] };
 
   setHandler(captureSignal, (input) => {
     pending.capture = input;
@@ -56,6 +59,9 @@ export async function stripeOrderWorkflow(args: StripeOrderArgs): Promise<Workfl
   });
   setHandler(reviseSignal, (input) => {
     pending.revise = input;
+  });
+  setHandler(multicaptureSignal, (input) => {
+    pending.multicapture.push(input);
   });
   setHandler(stateQuery, () => state);
 
@@ -75,7 +81,11 @@ export async function stripeOrderWorkflow(args: StripeOrderArgs): Promise<Workfl
     // Race: any pending signal returns immediately; else sleep until the
     // reauth deadline and reauthorize then.
     const settled = await Promise.race([
-      condition(() => Boolean(pending.capture || pending.cancel || pending.revise || pending.reauthAdmin)),
+      condition(
+        () =>
+          Boolean(pending.capture || pending.cancel || pending.revise || pending.reauthAdmin) ||
+          pending.multicapture.length > 0,
+      ),
       sleep(timerMs).then(() => 'timer' as const),
     ]);
 
@@ -85,8 +95,10 @@ export async function stripeOrderWorkflow(args: StripeOrderArgs): Promise<Workfl
     //               captures at the new amount, not the old
     //   3. admin reauth — same reasoning: run a queued non-terminal reauth
     //                     before a terminal capture
-    //   4. capture — terminal action
-    //   5. timer — implicit reauth deadline reached
+    //   4. multicapture — slice captures before a terminal full capture (the
+    //                     final slice carries isFinal and ends the loop)
+    //   5. capture — terminal action
+    //   6. timer — implicit reauth deadline reached
     if (pending.cancel) {
       state = await runCancel(state, pending.cancel);
       pending.cancel = undefined;
@@ -100,6 +112,12 @@ export async function stripeOrderWorkflow(args: StripeOrderArgs): Promise<Workfl
     if (pending.reauthAdmin) {
       state = await runReauthorize(state);
       pending.reauthAdmin = false;
+      continue;
+    }
+    if (pending.multicapture.length > 0) {
+      const slice = pending.multicapture.shift()!;
+      state = await runMulticapture(state, slice);
+      if (state.status === 'captured' || state.status === 'failed') break;
       continue;
     }
     if (pending.capture) {
@@ -161,7 +179,20 @@ async function runCapture(state: WorkflowState, input: CaptureSignalInput): Prom
       amountToCaptureCents: input.amountToCaptureCents,
       applicationFeeCents: input.applicationFeeCents,
     });
-    const next: WorkflowState = { ...state, status: 'captured' };
+    const next: WorkflowState = {
+      ...state,
+      capturedAmountCents: state.capturedAmountCents + result.amountCapturedCents,
+      captures: [
+        ...state.captures,
+        {
+          chargeId: result.chargeId,
+          amountCents: result.amountCapturedCents,
+          at: Date.now(),
+          isFinal: true,
+        },
+      ],
+      status: 'captured',
+    };
     await activities.persistContext(next);
     await activities.onCaptured(next, { id: result.chargeId, amountCents: result.amountCapturedCents });
     return next;
@@ -171,6 +202,44 @@ async function runCapture(state: WorkflowState, input: CaptureSignalInput): Prom
     await activities.onFailure(failed, errorPayload(err));
     return failed;
   }
+}
+
+async function runMulticapture(
+  state: WorkflowState,
+  input: MulticaptureSignalInput,
+): Promise<WorkflowState> {
+  const remaining = state.amountCents - state.capturedAmountCents;
+  if (input.amountCents <= 0 || input.amountCents > remaining) {
+    const failed: WorkflowState = { ...state, status: 'failed' };
+    await activities.persistContext(failed);
+    await activities.onFailure(failed, {
+      name: 'StripeOrderError',
+      message: `multicapture: amountCents ${input.amountCents} out of range (remaining: ${remaining})`,
+    });
+    return failed;
+  }
+  // Activity wiring lands in the next commit. For this commit, just append
+  // the slice to the audit log so downstream code can rely on the shape.
+  const isFinal = input.isFinal ?? false;
+  const next: WorkflowState = {
+    ...state,
+    capturedAmountCents: state.capturedAmountCents + input.amountCents,
+    captures: [
+      ...state.captures,
+      {
+        chargeId: 'pending',
+        amountCents: input.amountCents,
+        at: Date.now(),
+        isFinal,
+      },
+    ],
+    status: isFinal ? 'captured' : 'authorized',
+  };
+  await activities.persistContext(next);
+  if (isFinal) {
+    await activities.onCaptured(next, { id: 'pending', amountCents: input.amountCents });
+  }
+  return next;
 }
 
 async function runCancel(state: WorkflowState, input: CancelSignalInput): Promise<WorkflowState> {

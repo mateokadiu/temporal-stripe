@@ -3,6 +3,7 @@ export { stripeRefundWorkflow } from './stripe-refund.workflow.js';
 export {
   captureSignal,
   cancelSignal,
+  multicaptureSignal,
   reauthorizeSignal,
   reviseSignal,
   stateQuery,
@@ -10,6 +11,7 @@ export {
 export type {
   CaptureSignalInput,
   CancelSignalInput,
+  MulticaptureSignalInput,
   ReviseSignalInput,
 } from './signals.js';
 export {

@@ -7,6 +7,7 @@ import { stripeOrderWorkflow } from '../src/workflows/stripe-order.workflow.js';
 import {
   captureSignal,
   cancelSignal,
+  multicaptureSignal,
   reauthorizeSignal,
   reviseSignal,
   stateQuery,
@@ -299,6 +300,55 @@ describe('stripeOrderWorkflow', () => {
         args: [startArgs()],
       });
       await handle.signal(reauthorizeSignal);
+      return await handle.result();
+    });
+
+    expect(result.status).toBe('failed');
+    expect(log.onFailure).toBe(1);
+  });
+
+  it('multicapture signal accumulates capturedAmountCents and isFinal completes the workflow', async () => {
+    const { activities, log } = makeStubActivities();
+    const worker = await Worker.create({
+      connection: env.nativeConnection,
+      taskQueue: 'test-tq',
+      workflowsPath,
+      activities,
+    });
+
+    const result = await worker.runUntil(async () => {
+      const handle = await env.client.workflow.start(stripeOrderWorkflow, {
+        taskQueue: 'test-tq',
+        workflowId: `wf-multicap-${Math.floor(Math.random() * 1e9)}`,
+        args: [startArgs({ initialAmountCents: 5000 })],
+      });
+      await handle.signal(multicaptureSignal, { amountCents: 2000 });
+      await handle.signal(multicaptureSignal, { amountCents: 3000, isFinal: true });
+      return await handle.result();
+    });
+
+    expect(result.status).toBe('captured');
+    expect(result.capturedAmountCents).toBe(5000);
+    expect(result.captures).toHaveLength(2);
+    expect(result.captures[1]?.isFinal).toBe(true);
+  });
+
+  it('multicapture rejects over-capture and lands in failed', async () => {
+    const { activities, log } = makeStubActivities();
+    const worker = await Worker.create({
+      connection: env.nativeConnection,
+      taskQueue: 'test-tq',
+      workflowsPath,
+      activities,
+    });
+
+    const result = await worker.runUntil(async () => {
+      const handle = await env.client.workflow.start(stripeOrderWorkflow, {
+        taskQueue: 'test-tq',
+        workflowId: `wf-multicap-over-${Math.floor(Math.random() * 1e9)}`,
+        args: [startArgs({ initialAmountCents: 1000 })],
+      });
+      await handle.signal(multicaptureSignal, { amountCents: 9999, isFinal: true });
       return await handle.result();
     });
 
