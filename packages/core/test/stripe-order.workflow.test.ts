@@ -335,6 +335,122 @@ describe('stripeOrderWorkflow', () => {
     expect(result.captures[1]?.isFinal).toBe(true);
   });
 
+  it('multicapture intermediate slice keeps status=authorized and loops for more', async () => {
+    const { activities, log } = makeStubActivities();
+    const worker = await Worker.create({
+      connection: env.nativeConnection,
+      taskQueue: 'test-tq',
+      workflowsPath,
+      activities,
+    });
+
+    const result = await worker.runUntil(async () => {
+      const handle = await env.client.workflow.start(stripeOrderWorkflow, {
+        taskQueue: 'test-tq',
+        workflowId: `wf-multicap-mid-${Math.floor(Math.random() * 1e9)}`,
+        args: [startArgs({ initialAmountCents: 10_000 })],
+      });
+      await handle.signal(multicaptureSignal, { amountCents: 4000 });
+      // Allow the workflow to drain the first slice so a query reflects it.
+      let snap = await handle.query(stateQuery);
+      for (let i = 0; snap.capturedAmountCents === 0 && i < 50; i++) {
+        await new Promise((r) => setTimeout(r, 20));
+        snap = await handle.query(stateQuery);
+      }
+      expect(snap.capturedAmountCents).toBe(4000);
+      expect(snap.status).toBe('authorized');
+      expect(snap.captures).toHaveLength(1);
+      expect(snap.captures[0]?.isFinal).toBe(false);
+      // Send the final slice
+      await handle.signal(multicaptureSignal, { amountCents: 6000, isFinal: true });
+      return await handle.result();
+    });
+
+    expect(result.status).toBe('captured');
+    expect(result.capturedAmountCents).toBe(10_000);
+    expect(log.onCaptured).toBe(1);
+  });
+
+  it('multicapture activity failure surfaces onFailure and halts the workflow', async () => {
+    const log: ActivityCallLog = {
+      reauthorize: 0,
+      capture: 0,
+      cancel: 0,
+      revise: 0,
+      refund: 0,
+      persist: 0,
+      onCaptured: 0,
+      onCanceled: 0,
+      onReauthorized: 0,
+      onFailure: 0,
+    };
+    const activities: StripeOrderActivities = {
+      async reauthorizePayment() {
+        log.reauthorize += 1;
+        return {
+          newPaymentIntentId: 'pi_x',
+          authCreatedAt: Date.now(),
+          captureBefore: null,
+          cardBrand: 'visa',
+        };
+      },
+      async capturePaymentIntent() {
+        log.capture += 1;
+        throw new Error('stripe capture failed');
+      },
+      async cancelPaymentIntent() {
+        log.cancel += 1;
+      },
+      async revisePaymentIntent() {
+        log.revise += 1;
+        return {
+          newPaymentIntentId: 'pi_x',
+          authCreatedAt: Date.now(),
+          captureBefore: null,
+          cardBrand: 'visa',
+        };
+      },
+      async refundPaymentIntent() {
+        log.refund += 1;
+        return { refundId: 'rf_x', amountCents: 0 };
+      },
+      async persistContext() {
+        log.persist += 1;
+      },
+      async onCaptured() {
+        log.onCaptured += 1;
+      },
+      async onCanceled() {
+        log.onCanceled += 1;
+      },
+      async onReauthorized() {
+        log.onReauthorized += 1;
+      },
+      async onFailure() {
+        log.onFailure += 1;
+      },
+    };
+    const worker = await Worker.create({
+      connection: env.nativeConnection,
+      taskQueue: 'test-tq',
+      workflowsPath,
+      activities,
+    });
+
+    const result = await worker.runUntil(async () => {
+      const handle = await env.client.workflow.start(stripeOrderWorkflow, {
+        taskQueue: 'test-tq',
+        workflowId: `wf-multicap-fail-${Math.floor(Math.random() * 1e9)}`,
+        args: [startArgs({ initialAmountCents: 5000 })],
+      });
+      await handle.signal(multicaptureSignal, { amountCents: 2000, isFinal: true });
+      return await handle.result();
+    });
+
+    expect(result.status).toBe('failed');
+    expect(log.onFailure).toBe(1);
+  });
+
   it('multicapture rejects over-capture and lands in failed', async () => {
     const { activities, log } = makeStubActivities();
     const worker = await Worker.create({
