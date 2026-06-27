@@ -23,6 +23,12 @@ export interface CaptureInput {
   stripeAccountId: string;
   amountToCaptureCents?: number;
   applicationFeeCents?: number;
+  /**
+   * Stripe's `final_capture` flag — set true on the last slice of a multicapture
+   * sequence to release any remaining hold. False on intermediate slices.
+   * Omit on standard one-shot captures.
+   */
+  finalCapture?: boolean;
 }
 
 export interface CaptureResult {

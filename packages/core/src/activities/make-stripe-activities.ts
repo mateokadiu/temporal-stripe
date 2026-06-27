@@ -121,6 +121,9 @@ export function makeStripeActivities(
           ...(input.applicationFeeCents !== undefined
             ? { application_fee_amount: input.applicationFeeCents }
             : {}),
+          ...(input.finalCapture !== undefined
+            ? { final_capture: input.finalCapture }
+            : {}),
         },
         { stripeAccount: input.stripeAccountId },
       );

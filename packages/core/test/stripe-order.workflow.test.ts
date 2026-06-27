@@ -63,9 +63,11 @@ function makeStubActivities(opts: {
         cardBrand: 'visa',
       };
     },
-    async capturePaymentIntent(_input) {
+    async capturePaymentIntent(input) {
       log.capture += 1;
-      return { chargeId: 'ch_test', amountCapturedCents: opts.capturedAmountCents ?? 1999 };
+      const amount =
+        opts.capturedAmountCents ?? input.amountToCaptureCents ?? 1999;
+      return { chargeId: `ch_test_${log.capture}`, amountCapturedCents: amount };
     },
     async cancelPaymentIntent(_input) {
       log.cancel += 1;

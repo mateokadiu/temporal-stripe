@@ -218,28 +218,44 @@ async function runMulticapture(
     });
     return failed;
   }
-  // Activity wiring lands in the next commit. For this commit, just append
-  // the slice to the audit log so downstream code can rely on the shape.
   const isFinal = input.isFinal ?? false;
-  const next: WorkflowState = {
-    ...state,
-    capturedAmountCents: state.capturedAmountCents + input.amountCents,
-    captures: [
-      ...state.captures,
-      {
-        chargeId: 'pending',
-        amountCents: input.amountCents,
-        at: Date.now(),
-        isFinal,
-      },
-    ],
-    status: isFinal ? 'captured' : 'authorized',
-  };
-  await activities.persistContext(next);
-  if (isFinal) {
-    await activities.onCaptured(next, { id: 'pending', amountCents: input.amountCents });
+  state = { ...state, status: 'capturing' };
+  try {
+    const result = await activities.capturePaymentIntent({
+      paymentIntentId: state.paymentIntentId,
+      stripeAccountId: state.stripeAccountId,
+      amountToCaptureCents: input.amountCents,
+      applicationFeeCents: input.applicationFeeCents,
+      finalCapture: isFinal,
+    });
+    const next: WorkflowState = {
+      ...state,
+      capturedAmountCents: state.capturedAmountCents + result.amountCapturedCents,
+      captures: [
+        ...state.captures,
+        {
+          chargeId: result.chargeId,
+          amountCents: result.amountCapturedCents,
+          at: Date.now(),
+          isFinal,
+        },
+      ],
+      status: isFinal ? 'captured' : 'authorized',
+    };
+    await activities.persistContext(next);
+    if (isFinal) {
+      await activities.onCaptured(next, {
+        id: result.chargeId,
+        amountCents: result.amountCapturedCents,
+      });
+    }
+    return next;
+  } catch (err) {
+    const failed: WorkflowState = { ...state, status: 'failed' };
+    await activities.persistContext(failed);
+    await activities.onFailure(failed, errorPayload(err));
+    return failed;
   }
-  return next;
 }
 
 async function runCancel(state: WorkflowState, input: CancelSignalInput): Promise<WorkflowState> {
