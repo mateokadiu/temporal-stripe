@@ -95,6 +95,22 @@ export interface StripeRefundActivities {
   ): Promise<void>;
 }
 
+/** Split reauth steps for saga-based reauth. */
+export interface TagCancelInput {
+  paymentIntentId: string;
+  stripeAccountId: string;
+}
+
+export interface CreateReauthorizedPaymentIntentInput {
+  oldPaymentIntentId: string;
+  paymentMethodId: string;
+  stripeAccountId: string;
+  customerId: string;
+  amountCents: number;
+  currency: string;
+  metadata: Record<string, string>;
+}
+
 /**
  * All methods are non-optional so `proxyActivities<StripeOrderActivities>` can
  * call them through Temporal without optional-chain gymnastics. The default
@@ -104,6 +120,22 @@ export interface StripeRefundActivities {
  */
 export interface StripeOrderActivities {
   reauthorizePayment(input: ReauthorizeInput): Promise<ReauthorizeResult>;
+  /**
+   * Step 1 of reauth: tag + cancel the old PaymentIntent so the webhook filter
+   * can ignore the resulting `payment_intent.canceled` event. Exposed as its
+   * own activity so the workflow can put the two reauth halves behind a saga
+   * and compensate if step 2 fails.
+   */
+  tagAndCancelOldPaymentIntent(input: TagCancelInput): Promise<void>;
+  /**
+   * Step 2 of reauth: create the new PaymentIntent on the saved payment method.
+   * If this fails after step 1 succeeded, the saga's only realistic
+   * compensation is to log + persist a failed state — Stripe doesn't let you
+   * un-cancel a PI. The activity exists to give the saga a clean boundary.
+   */
+  createReauthorizedPaymentIntent(
+    input: CreateReauthorizedPaymentIntentInput,
+  ): Promise<ReauthorizeResult>;
   capturePaymentIntent(input: CaptureInput): Promise<CaptureResult>;
   cancelPaymentIntent(input: CancelInput): Promise<void>;
   revisePaymentIntent(input: ReviseInput): Promise<ReviseResult>;

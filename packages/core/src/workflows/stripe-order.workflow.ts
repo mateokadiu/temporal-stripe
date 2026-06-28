@@ -1,6 +1,7 @@
 import { proxyActivities, setHandler, condition, sleep, log } from '@temporalio/workflow';
 import type { StripeOrderActivities } from '../activities/interface.js';
 import { initialStateFromArgs, type StripeOrderArgs, type WorkflowState } from '../state.js';
+import { SagaRegistry, runSagaStep } from '../saga.js';
 import { getReauthTimerMs } from './reauth-timer.js';
 import {
   captureSignal,
@@ -136,17 +137,44 @@ export async function stripeOrderWorkflow(args: StripeOrderArgs): Promise<Workfl
 
 async function runReauthorize(state: WorkflowState): Promise<WorkflowState> {
   state = { ...state, status: 'reauthorizing' };
+  const saga = new SagaRegistry();
+  const oldPaymentIntentId = state.paymentIntentId;
+
   try {
-    const result = await activities.reauthorizePayment({
-      orderId: state.orderId,
-      oldPaymentIntentId: state.paymentIntentId,
-      paymentMethodId: state.paymentMethodId,
-      stripeAccountId: state.stripeAccountId,
-      customerId: state.customerId,
-      amountCents: state.amountCents,
-      currency: state.currency,
-      metadata: state.metadata,
+    // Step 1: tag + cancel the old PI. Compensation is logged not actioned —
+    // Stripe doesn't support un-cancelling, so the saga's job here is to
+    // make sure we surface the partial-progress state to onFailure.
+    await runSagaStep(saga, {
+      name: 'tag-cancel-old-pi',
+      forward: async () => {
+        await activities.tagAndCancelOldPaymentIntent({
+          paymentIntentId: oldPaymentIntentId,
+          stripeAccountId: state.stripeAccountId,
+        });
+      },
+      compensate: async () => {
+        log.warn('reauth saga: cannot un-cancel old PI; surfacing partial state', {
+          orderId: state.orderId,
+          oldPaymentIntentId,
+        });
+      },
     });
+
+    // Step 2: create the new PI. If this fails, the saga unwinds — see above.
+    const result = await runSagaStep(saga, {
+      name: 'create-reauthorized-pi',
+      forward: async () =>
+        activities.createReauthorizedPaymentIntent({
+          oldPaymentIntentId,
+          paymentMethodId: state.paymentMethodId,
+          stripeAccountId: state.stripeAccountId,
+          customerId: state.customerId,
+          amountCents: state.amountCents,
+          currency: state.currency,
+          metadata: state.metadata,
+        }),
+    });
+
     const next: WorkflowState = {
       ...state,
       paymentIntentId: result.newPaymentIntentId,
@@ -163,9 +191,17 @@ async function runReauthorize(state: WorkflowState): Promise<WorkflowState> {
     });
     return next;
   } catch (err) {
+    // Run compensations (logging-only for reauth — Stripe is one-way) and
+    // surface the partial-progress state so the consumer's onFailure can
+    // decide whether to retry the whole flow.
+    const compensationFailures = await saga.compensate();
     const failed: WorkflowState = { ...state, status: 'failed' };
     await activities.persistContext(failed);
-    await activities.onFailure(failed, errorPayload(err));
+    const payload = errorPayload(err);
+    const annotated = compensationFailures.length
+      ? { ...payload, message: `${payload.message} [compensation failures: ${compensationFailures.join(',')}]` }
+      : payload;
+    await activities.onFailure(failed, annotated);
     return failed;
   }
 }

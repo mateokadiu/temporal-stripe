@@ -5,6 +5,7 @@ import type {
   CaptureInput,
   CaptureResult,
   CancelInput,
+  CreateReauthorizedPaymentIntentInput,
   ReauthorizeInput,
   ReauthorizeResult,
   RefundInput,
@@ -13,6 +14,7 @@ import type {
   ReviseResult,
   StripeOrderActivities,
   StripeRefundActivities,
+  TagCancelInput,
 } from './interface.js';
 
 export interface MakeStripeActivitiesOptions {
@@ -57,7 +59,7 @@ export function makeStripeActivities(
   }
 
   async function createReauthorizedIntent(
-    input: ReauthorizeInput,
+    input: ReauthorizeInput | CreateReauthorizedPaymentIntentInput,
     extraMetadata: Record<string, string>,
   ): Promise<ReauthorizeResult> {
     const created = await stripe.paymentIntents.create(
@@ -102,6 +104,30 @@ export function makeStripeActivities(
     async reauthorizePayment(input: ReauthorizeInput): Promise<ReauthorizeResult> {
       try {
         await tagAndCancel(input.oldPaymentIntentId, input.stripeAccountId);
+        return await createReauthorizedIntent(input, {});
+      } catch (err) {
+        throw new StripeOrderError(
+          ERROR_CODES.REAUTH_FAILED,
+          err instanceof Error ? err.message : String(err),
+        );
+      }
+    },
+
+    async tagAndCancelOldPaymentIntent(input: TagCancelInput): Promise<void> {
+      try {
+        await tagAndCancel(input.paymentIntentId, input.stripeAccountId);
+      } catch (err) {
+        throw new StripeOrderError(
+          ERROR_CODES.REAUTH_FAILED,
+          err instanceof Error ? err.message : String(err),
+        );
+      }
+    },
+
+    async createReauthorizedPaymentIntent(
+      input: CreateReauthorizedPaymentIntentInput,
+    ): Promise<ReauthorizeResult> {
+      try {
         return await createReauthorizedIntent(input, {});
       } catch (err) {
         throw new StripeOrderError(

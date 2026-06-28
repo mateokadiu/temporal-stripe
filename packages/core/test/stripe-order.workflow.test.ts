@@ -21,6 +21,8 @@ const workflowsPath = path.resolve(__dirname, '../src/workflows/index.ts');
 
 interface ActivityCallLog {
   reauthorize: number;
+  tagCancel: number;
+  createReauthPi: number;
   capture: number;
   cancel: number;
   revise: number;
@@ -34,11 +36,17 @@ interface ActivityCallLog {
 
 function makeStubActivities(opts: {
   reauthSucceeds?: boolean;
+  /** When set, controls which half of the split reauth fails.
+   *  'tag-cancel' simulates tag/cancel succeeds + create fails — the saga
+   *  partial-progress path. 'create' is identical to reauthSucceeds=false. */
+  reauthFailMode?: 'tag-cancel-then-create-fails' | 'tag-cancel-fails';
   newPiPrefix?: string;
   capturedAmountCents?: number;
 } = {}): { activities: StripeOrderActivities; log: ActivityCallLog; lastPersisted: { value: WorkflowState | null } } {
   const log: ActivityCallLog = {
     reauthorize: 0,
+    tagCancel: 0,
+    createReauthPi: 0,
     capture: 0,
     cancel: 0,
     revise: 0,
@@ -58,6 +66,27 @@ function makeStubActivities(opts: {
       if (!reauthSucceeds) throw new Error('stripe transient failure');
       return {
         newPaymentIntentId: `${opts.newPiPrefix ?? 'pi_reauth'}_${log.reauthorize}`,
+        authCreatedAt: Date.now(),
+        captureBefore: null,
+        cardBrand: 'visa',
+      };
+    },
+    async tagAndCancelOldPaymentIntent(_input) {
+      log.tagCancel += 1;
+      if (opts.reauthFailMode === 'tag-cancel-fails') {
+        throw new Error('stripe transient failure');
+      }
+    },
+    async createReauthorizedPaymentIntent(_input) {
+      log.createReauthPi += 1;
+      if (
+        !reauthSucceeds ||
+        opts.reauthFailMode === 'tag-cancel-then-create-fails'
+      ) {
+        throw new Error('stripe transient failure');
+      }
+      return {
+        newPaymentIntentId: `${opts.newPiPrefix ?? 'pi_reauth'}_${log.createReauthPi}`,
         authCreatedAt: Date.now(),
         captureBefore: null,
         cardBrand: 'visa',
@@ -179,7 +208,10 @@ describe('stripeOrderWorkflow', () => {
       return await handle.result();
     });
 
-    expect(log.reauthorize).toBeGreaterThanOrEqual(1);
+    // With the saga-split reauth, tagCancel + createReauthPi run instead of
+    // the legacy `reauthorize` activity.
+    expect(log.tagCancel).toBeGreaterThanOrEqual(1);
+    expect(log.createReauthPi).toBeGreaterThanOrEqual(1);
     expect(log.onReauthorized).toBeGreaterThanOrEqual(1);
     expect(result.status).toBe('captured');
     expect(result.reauthorizationCount).toBeGreaterThanOrEqual(1);
@@ -206,7 +238,8 @@ describe('stripeOrderWorkflow', () => {
       return await handle.result();
     });
 
-    expect(log.reauthorize).toBe(1);
+    expect(log.tagCancel).toBe(1);
+    expect(log.createReauthPi).toBe(1);
     expect(log.capture).toBe(1);
     expect(result.status).toBe('captured');
     expect(result.reauthorizationCount).toBe(1);
@@ -309,6 +342,85 @@ describe('stripeOrderWorkflow', () => {
     expect(log.onFailure).toBe(1);
   });
 
+  it('saga reauth: split into tag-cancel + create; both run on the happy path', async () => {
+    const { activities, log } = makeStubActivities();
+    const worker = await Worker.create({
+      connection: env.nativeConnection,
+      taskQueue: 'test-tq',
+      workflowsPath,
+      activities,
+    });
+
+    const result = await worker.runUntil(async () => {
+      const handle = await env.client.workflow.start(stripeOrderWorkflow, {
+        taskQueue: 'test-tq',
+        workflowId: `wf-saga-happy-${Math.floor(Math.random() * 1e9)}`,
+        args: [startArgs()],
+      });
+      await handle.signal(reauthorizeSignal);
+      await handle.signal(captureSignal, {});
+      return await handle.result();
+    });
+
+    expect(log.tagCancel).toBe(1);
+    expect(log.createReauthPi).toBe(1);
+    expect(result.status).toBe('captured');
+  });
+
+  it('saga reauth: tag-cancel succeeds, create fails → lands in failed with onFailure', async () => {
+    const { activities, log } = makeStubActivities({
+      reauthFailMode: 'tag-cancel-then-create-fails',
+    });
+    const worker = await Worker.create({
+      connection: env.nativeConnection,
+      taskQueue: 'test-tq',
+      workflowsPath,
+      activities,
+    });
+
+    const result = await worker.runUntil(async () => {
+      const handle = await env.client.workflow.start(stripeOrderWorkflow, {
+        taskQueue: 'test-tq',
+        workflowId: `wf-saga-half-fail-${Math.floor(Math.random() * 1e9)}`,
+        args: [startArgs()],
+      });
+      await handle.signal(reauthorizeSignal);
+      return await handle.result();
+    });
+
+    // tagCancel runs once + succeeds. createReauthPi exhausts its retries.
+    expect(log.tagCancel).toBeGreaterThanOrEqual(1);
+    expect(log.createReauthPi).toBeGreaterThanOrEqual(1);
+    expect(result.status).toBe('failed');
+    expect(log.onFailure).toBe(1);
+  });
+
+  it('saga reauth: tag-cancel fails first → create never runs', async () => {
+    const { activities, log } = makeStubActivities({ reauthFailMode: 'tag-cancel-fails' });
+    const worker = await Worker.create({
+      connection: env.nativeConnection,
+      taskQueue: 'test-tq',
+      workflowsPath,
+      activities,
+    });
+
+    const result = await worker.runUntil(async () => {
+      const handle = await env.client.workflow.start(stripeOrderWorkflow, {
+        taskQueue: 'test-tq',
+        workflowId: `wf-saga-step1-fail-${Math.floor(Math.random() * 1e9)}`,
+        args: [startArgs()],
+      });
+      await handle.signal(reauthorizeSignal);
+      return await handle.result();
+    });
+
+    // After tagCancel's retries are exhausted, createReauthPi must not run.
+    expect(log.tagCancel).toBeGreaterThanOrEqual(1);
+    expect(log.createReauthPi).toBe(0);
+    expect(result.status).toBe('failed');
+    expect(log.onFailure).toBe(1);
+  });
+
   it('multicapture signal accumulates capturedAmountCents and isFinal completes the workflow', async () => {
     const { activities, log } = makeStubActivities();
     const worker = await Worker.create({
@@ -374,6 +486,8 @@ describe('stripeOrderWorkflow', () => {
   it('multicapture activity failure surfaces onFailure and halts the workflow', async () => {
     const log: ActivityCallLog = {
       reauthorize: 0,
+      tagCancel: 0,
+      createReauthPi: 0,
       capture: 0,
       cancel: 0,
       revise: 0,
@@ -387,6 +501,18 @@ describe('stripeOrderWorkflow', () => {
     const activities: StripeOrderActivities = {
       async reauthorizePayment() {
         log.reauthorize += 1;
+        return {
+          newPaymentIntentId: 'pi_x',
+          authCreatedAt: Date.now(),
+          captureBefore: null,
+          cardBrand: 'visa',
+        };
+      },
+      async tagAndCancelOldPaymentIntent() {
+        log.tagCancel += 1;
+      },
+      async createReauthorizedPaymentIntent() {
+        log.createReauthPi += 1;
         return {
           newPaymentIntentId: 'pi_x',
           authCreatedAt: Date.now(),
