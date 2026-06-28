@@ -22,3 +22,18 @@ export const REAUTH_WINDOW_MS = {
 /** Minimum reauth timer — protects against runaway loops if the system clock
  *  drifts or someone passes a stale authCreatedAt. */
 export const MIN_REAUTH_TIMER_MS = 60 * 60 * 1000; // 1 hour
+
+/**
+ * Per-brand expiry override map. Keys are lowercased card brand strings as
+ * Stripe reports them in `payment_method_details.card.brand`; values are
+ * milliseconds from `authCreatedAt` after which the reauth timer should fire.
+ *
+ * Defaults cover the brands we've observed in production data. Override via
+ * the `brandExpiryOverrides` option on `getReauthTimerMs` to handle
+ * region-specific issuers (e.g. JCB, UnionPay, regional Amex variants).
+ */
+export const DEFAULT_BRAND_EXPIRY_OVERRIDES_MS: Readonly<Record<string, number>> = Object.freeze({
+  visa: REAUTH_WINDOW_MS.visa,
+  // Mastercard, Amex, Discover, Diners, JCB and UnionPay all use the 7-day
+  // default at the brand level; consumers can override individually.
+});

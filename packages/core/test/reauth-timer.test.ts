@@ -67,4 +67,72 @@ describe('getReauthTimerMs', () => {
     });
     expect(result).toBe(MIN_REAUTH_TIMER_MS);
   });
+
+  it('per-brand override takes precedence over the library default', () => {
+    const now = 1_000_000_000_000;
+    const customAmex = 3 * DAY; // override Amex to fire at 3d
+    expect(
+      getReauthTimerMs({
+        cardBrand: 'amex',
+        authCreatedAt: now,
+        captureBefore: null,
+        now,
+        brandExpiryOverrides: { amex: customAmex },
+      }),
+    ).toBe(customAmex);
+  });
+
+  it('per-brand override is case-insensitive on the brand', () => {
+    const now = 1_000_000_000_000;
+    expect(
+      getReauthTimerMs({
+        cardBrand: 'JCB',
+        authCreatedAt: now,
+        captureBefore: null,
+        now,
+        brandExpiryOverrides: { jcb: 2 * DAY },
+      }),
+    ).toBe(2 * DAY);
+  });
+
+  it('caller override beats the package-default override (Visa)', () => {
+    const now = 1_000_000_000_000;
+    // Override Visa from 4d down to 2d.
+    expect(
+      getReauthTimerMs({
+        cardBrand: 'visa',
+        authCreatedAt: now,
+        captureBefore: null,
+        now,
+        brandExpiryOverrides: { visa: 2 * DAY },
+      }),
+    ).toBe(2 * DAY);
+  });
+
+  it('captureBefore still beats per-brand overrides', () => {
+    const now = 1_000_000_000_000;
+    const captureBefore = now + 10 * DAY;
+    expect(
+      getReauthTimerMs({
+        cardBrand: 'amex',
+        authCreatedAt: now,
+        captureBefore,
+        now,
+        brandExpiryOverrides: { amex: 3 * DAY },
+      }),
+    ).toBe(10 * DAY - DAY);
+  });
+
+  it('unknown brand with no override falls into the default window', () => {
+    const now = 1_000_000_000_000;
+    expect(
+      getReauthTimerMs({
+        cardBrand: 'unionpay',
+        authCreatedAt: now,
+        captureBefore: null,
+        now,
+        brandExpiryOverrides: { jcb: 2 * DAY },
+      }),
+    ).toBe(REAUTH_WINDOW_MS.default);
+  });
 });

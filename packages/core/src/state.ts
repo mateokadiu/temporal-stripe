@@ -13,6 +13,12 @@ export const StripeOrderArgsSchema = z.object({
   captureBefore: z.number().int().positive().nullable(),
   reauthorizationCount: z.number().int().nonnegative().default(0),
   metadata: z.record(z.string()).optional(),
+  /**
+   * Per-brand expiry overrides — keys are lowercased brand strings, values are
+   * milliseconds from `authCreatedAt`. Lets consumers tune for region-specific
+   * issuers without forking the library defaults.
+   */
+  brandExpiryOverrides: z.record(z.number().int().positive()).optional(),
 });
 // z.input — `reauthorizationCount` and `metadata` are optional in caller input;
 // `initialStateFromArgs` applies defaults.
@@ -47,6 +53,8 @@ export interface WorkflowState {
   reauthorizationCount: number;
   metadata: Record<string, string>;
   status: WorkflowStatus;
+  /** Per-brand expiry overrides — carried through reauth/revision. */
+  brandExpiryOverrides?: Readonly<Record<string, number>>;
 }
 
 export type WorkflowStatus =
@@ -160,5 +168,6 @@ export function initialStateFromArgs(args: StripeOrderArgs): WorkflowState {
     reauthorizationCount: args.reauthorizationCount ?? 0,
     metadata: args.metadata ?? {},
     status: 'authorized',
+    brandExpiryOverrides: args.brandExpiryOverrides,
   };
 }

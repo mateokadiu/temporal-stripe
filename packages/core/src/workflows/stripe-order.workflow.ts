@@ -71,6 +71,7 @@ export async function stripeOrderWorkflow(args: StripeOrderArgs): Promise<Workfl
       cardBrand: state.cardBrand,
       authCreatedAt: state.authCreatedAt,
       captureBefore: state.captureBefore,
+      brandExpiryOverrides: state.brandExpiryOverrides,
     });
 
     log.info('waiting for next event', {
