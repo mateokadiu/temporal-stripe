@@ -9,7 +9,7 @@ npm i @temporal-stripe/webhook   # tiny, no Temporal dep
 
 | Package | What it does |
 |---|---|
-| [`@temporal-stripe/core`](./packages/core) | Workflow + activities + signals for the PaymentIntent lifecycle (reauth, capture, refund, revise) |
+| [`@temporal-stripe/core`](./packages/core) | Workflows + activities + signals for the PaymentIntent lifecycle (reauth, capture, multicapture, refund, dispute, revise) |
 | [`@temporal-stripe/webhook`](./packages/webhook) | Tiny helpers to filter our own reauth-initiated `payment_intent.canceled` events |
 
 ---
@@ -69,17 +69,30 @@ The library never assumes a DB schema. You provide `persistContext(ctx)` and the
 | Signal | Payload | What it does |
 |---|---|---|
 | `capture` | `{ amountToCaptureCents?, applicationFeeCents? }` | Capture (full or partial). Terminal. |
+| `multicapture` | `{ amountCents, isFinal?, applicationFeeCents? }` | Capture a slice against the PI. `isFinal: true` releases any remaining hold via `paymentIntents.capture(final_capture)` and terminates the workflow. Intermediate slices loop. |
 | `cancel` | `{ reason: 'customer' \| 'admin' \| 'fraud' \| 'timeout' \| 'unrecoverable_error', notes? }` | Cancel the PI. Terminal. |
 | `reauthorize` | — | Force an immediate reauth, bypassing the timer. Loops. |
 | `revise` | `{ newAmountCents, reason? }` | Drop the PI to a smaller amount via tag-cancel-recreate. Loops. Increases are rejected. |
 
-If multiple signals are pending in the same workflow tick, priority is **cancel > revise > admin reauth > capture**. That way a "drop the price *then* capture" sequence sent in quick succession lands at the new amount.
+If multiple signals are pending in the same workflow tick, priority is **cancel > revise > admin reauth > multicapture > capture**. That way a "drop the price *then* capture" sequence sent in quick succession lands at the new amount.
+
+### Refund workflow signals
+
+Run `stripeRefundWorkflow` per captured PI for the long-tail refund and chargeback path. Lives separately so the order workflow can terminate cleanly at capture while this one keeps listening through the chargeback window (60-120 days).
+
+| Signal | Payload | What it does |
+|---|---|---|
+| `refundRequest` | `{ amountCents?, reason?, notes?, reverseTransfer?, refundApplicationFee? }` | Issue a refund. Omit `amountCents` to refund the remaining balance. Accumulates across multiple signals. |
+| `disputeOpened` | `{ disputeId, amountCents, reason? }` | A Stripe dispute landed. Workflow flips to `disputed`; further refund signals are short-circuited (Stripe rejects them anyway). |
+| `disputeClosed` | `{ disputeId, status }` | Dispute resolved (won / lost / warning_closed). Workflow flips to `dispute_closed` and is eligible to take more refunds again. |
 
 ### Activity contract
 
 ```ts
 interface StripeOrderActivities {
   reauthorizePayment(input): Promise<{ newPaymentIntentId; authCreatedAt; captureBefore; cardBrand }>;
+  tagAndCancelOldPaymentIntent(input): Promise<void>;
+  createReauthorizedPaymentIntent(input): Promise<{ newPaymentIntentId; authCreatedAt; captureBefore; cardBrand }>;
   capturePaymentIntent(input): Promise<{ chargeId; amountCapturedCents }>;
   cancelPaymentIntent(input): Promise<void>;
   revisePaymentIntent(input): Promise<{ newPaymentIntentId; authCreatedAt; captureBefore; cardBrand }>;
@@ -90,9 +103,58 @@ interface StripeOrderActivities {
   onReauthorized(ctx, pi): Promise<void>;
   onFailure(ctx, err): Promise<void>;
 }
+
+interface StripeRefundActivities {
+  refundPaymentIntent(input): Promise<{ refundId; amountCents; status? }>;
+  persistRefundContext(ctx): Promise<void>;
+  onRefunded(ctx, refund): Promise<void>;
+  onDisputeOpened(ctx, dispute): Promise<void>;
+  onDisputeClosed(ctx, dispute): Promise<void>;
+  onRefundFailure(ctx, err): Promise<void>;
+}
 ```
 
-`makeStripeActivities(stripe, opts)` returns a ready-to-go implementation of every method against the official `stripe` SDK. You only need to supply `persistContext` (and any hooks you care about); everything Stripe-related is wired for you.
+`makeStripeActivities(stripe, opts)` returns a ready-to-go implementation of every method against the official `stripe` SDK. You only need to supply `persistContext` (and any hooks you care about); everything Stripe-related is wired for you. A companion `makeStripeRefundActivities(stripe, opts)` does the same for the refund workflow.
+
+### Saga primitive
+
+`runSagaStep` + `SagaRegistry` are exported for workflows that chain irreversible Stripe calls (e.g. reauth = tag-cancel-old + create-new). Compensation closures run LIFO on failure; individual compensation errors are logged not thrown so cleanup is best-effort.
+
+```ts
+import { SagaRegistry, runSagaStep } from '@temporal-stripe/core';
+
+const saga = new SagaRegistry();
+try {
+  await runSagaStep(saga, {
+    name: 'tag-cancel',
+    forward: () => activities.tagAndCancelOldPaymentIntent({ ... }),
+    compensate: async () => { /* logged — Stripe can't un-cancel */ },
+  });
+  await runSagaStep(saga, {
+    name: 'create-new-pi',
+    forward: () => activities.createReauthorizedPaymentIntent({ ... }),
+  });
+} catch (err) {
+  const failures = await saga.compensate();
+  // surface partial-progress state via onFailure with failures annotation
+}
+```
+
+The reauth flow already uses this internally; the primitive is exported so consumers can wrap their own multi-step Stripe sequences (e.g. transfer + payout, Connect onboarding).
+
+### Per-issuer expiry overrides
+
+Pass `brandExpiryOverrides` on the workflow args to tune the reauth window for region-specific issuers. Keys are lowercased card brands; values are milliseconds from `authCreatedAt`. `captureBefore` (extended auth) still wins; otherwise the caller override beats the package default beats `REAUTH_WINDOW_MS.default`.
+
+```ts
+args: [{
+  // ...
+  brandExpiryOverrides: {
+    jcb: 2 * 24 * 60 * 60 * 1000,        // override JCB to fire at 2d
+    'union pay': 3 * 24 * 60 * 60 * 1000,
+  },
+}]
+```
 
 ---
 
@@ -188,9 +250,23 @@ A fully runnable demo lives in [`examples/basic`](./examples/basic).
 
 ## Status
 
-Pre-1.0. The PaymentIntent-lifecycle surface (capture/cancel/reauth/revise) is stable in v0.x. Refund support is currently activity-level — a dedicated `stripeRefundWorkflow` for long-tail refund/chargeback handling is planned for v0.2.
+v1.0. PaymentIntent lifecycle (capture/cancel/reauth/revise/multicapture), refund + dispute workflow, saga primitive and per-issuer expiry overrides are all GA. Subsequent versions follow semantic-release conventions.
 
 See [PLAN.md](./PLAN.md) for the full architecture + phase roadmap.
+
+## Changelog
+
+### v1.0.0
+
+- **New `stripeRefundWorkflow`** for long-tail refund + chargeback handling. Signals: `refundRequest`, `disputeOpened`, `disputeClosed`. Accumulates partial refunds and short-circuits new refunds while a dispute is open.
+- **Multicapture** via the `multicapture` signal — accumulates captures across multiple slices and flips `isFinal: true` to release the remaining hold (`paymentIntents.capture(final_capture)`).
+- **Saga primitive** (`runSagaStep` + `SagaRegistry`) — compensations registered in order, unwound LIFO on failure. Reauth now runs through it so partial progress (old cancelled, new not created) surfaces cleanly via `onFailure` with compensation-failure annotations.
+- **Per-issuer expiry overrides** — `brandExpiryOverrides` on workflow args lets consumers tune the reauth window for region-specific issuers without forking the library defaults.
+- Activity contract split: `tagAndCancelOldPaymentIntent` + `createReauthorizedPaymentIntent` exposed as separate proxies for saga use. Legacy `reauthorizePayment` retained for back-compat.
+
+### v0.1.0
+
+- Initial cut: `stripeOrderWorkflow` with reauth-timer + signals (capture/cancel/reauthorize/revise) + webhook filter package.
 
 ## Contributing
 
@@ -200,7 +276,7 @@ PRs welcome. The core invariant: workflow code stays deterministic — no `Date.
 pnpm install
 pnpm build       # tsup, dual ESM+CJS
 pnpm typecheck
-pnpm test        # 31 tests across both packages
+pnpm test        # 60 tests across both packages
 ```
 
 ## License
