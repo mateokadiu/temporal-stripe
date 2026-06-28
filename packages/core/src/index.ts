@@ -6,6 +6,8 @@
 export * from './workflows/index.js';
 export * from './state.js';
 export * from './errors.js';
+export { SagaRegistry, runSagaStep } from './saga.js';
+export type { SagaStep } from './saga.js';
 export {
   REAUTHORIZATION_METADATA_KEY,
   REAUTHORIZATION_METADATA_VALUE,
