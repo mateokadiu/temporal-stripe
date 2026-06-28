@@ -1,7 +1,7 @@
 {
   "name": "temporal-stripe",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "description": "Temporal workflows for the Stripe Connect lifecycle: reauthorization, capture, refund, revision, webhook filtering.",
   "license": "MIT",
   "author": "Mateo Kadiu",

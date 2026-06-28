@@ -1,6 +1,6 @@
 {
   "name": "@temporal-stripe/core",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "description": "Temporal workflow + activities for the Stripe Connect lifecycle (reauthorization, capture, refund, revision).",
   "license": "MIT",
   "author": "Mateo Kadiu",
