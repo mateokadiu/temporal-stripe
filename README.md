@@ -1,6 +1,11 @@
 # temporal-stripe
 
-Temporal workflows for the parts of the Stripe Connect lifecycle that aren't in Stripe's docs and that almost everyone hand-rolls and gets wrong.
+> Temporal workflows for the Stripe Connect lifecycle that almost everyone hand-rolls and gets wrong: reauthorization before auth expiry, multi-capture, partial refunds, order revisions, refunds + disputes, and the webhook gymnastics that come with them.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Status](https://img.shields.io/badge/status-v1.0-brightgreen)](#status)
+[![Node](https://img.shields.io/badge/node-%E2%89%A520-brightgreen)](#requirements)
+[![Stripe](https://img.shields.io/badge/stripe-17%2B-635bff)](#requirements)
 
 ```
 npm i @temporal-stripe/core
@@ -11,6 +16,20 @@ npm i @temporal-stripe/webhook   # tiny, no Temporal dep
 |---|---|
 | [`@temporal-stripe/core`](./packages/core) | Workflows + activities + signals for the PaymentIntent lifecycle (reauth, capture, multicapture, refund, dispute, revise) |
 | [`@temporal-stripe/webhook`](./packages/webhook) | Tiny helpers to filter our own reauth-initiated `payment_intent.canceled` events |
+
+## Contents
+
+- [The problem](#the-problem)
+- [What you get](#what-you-get)
+- [Signals](#signals)
+- [Refund + dispute workflow](#refund--dispute-workflow)
+- [Activity contract](#activity-contract)
+- [Saga primitive](#saga-primitive)
+- [Per-issuer expiry overrides](#per-issuer-expiry-overrides)
+- [Quick start](#quick-start)
+- [Status](#status)
+- [Changelog](#changelog)
+- [Contributing](#contributing)
 
 ---
 
@@ -26,17 +45,22 @@ Stripe expires manual-capture PaymentIntents:
 
 If you ship physical goods, run a fraud hold, schedule delivery, or have any process longer than a few hours between auth and capture — **the auth will expire on you in production**. The fix is "reauthorization": tag the old PI, cancel it, create a new one against the saved payment method, keep going.
 
-That sounds like six lines of code. It's six lines of code and twelve edge cases:
+That sounds like six lines of code. It's six lines of code and twelve edge cases.
 
-- the original PI must've been created with `setup_future_usage: 'off_session'` for the payment method to be reusable;
-- cancelling fires `payment_intent.canceled` — your "order canceled" handler will fire on *your own reauth* unless you tag and filter it;
-- the new PI's expiry timer needs to be recomputed from the new charge's `capture_before` and card brand;
-- revisions (drop the order total) re-amount the PI — same reauth flow, different trigger;
-- partial captures with Connect get tangled with application fees;
-- admin "reauth this now" overrides have to coexist with the timer;
-- and the timer itself has to survive worker restarts.
+<details>
+<summary><b>Why the naive reauth is wrong</b> — six edge cases nobody documents</summary>
+
+- The original PI must've been created with `setup_future_usage: 'off_session'` for the payment method to be reusable.
+- Cancelling fires `payment_intent.canceled` — your "order canceled" handler will fire on *your own reauth* unless you tag and filter it.
+- The new PI's expiry timer needs to be recomputed from the new charge's `capture_before` and card brand (which can change if the payment method is updated).
+- Revisions (drop the order total) re-amount the PI — same reauth flow, different trigger.
+- Partial captures with Connect get tangled with application fees (intermediate slice vs final-capture release).
+- Admin "reauth this now" overrides have to coexist with the timer without racing.
+- And the timer itself has to survive worker restarts.
 
 Temporal solves the "survive restarts" part. This library solves the rest.
+
+</details>
 
 ---
 
@@ -44,27 +68,31 @@ Temporal solves the "survive restarts" part. This library solves the rest.
 
 A single `stripeOrderWorkflow` that owns one PaymentIntent end-to-end, with a small set of signals and a clean activity interface:
 
-```
-   ┌─ Temporal workflow ─────────────────────┐
-   │                                         │
-   │   ┌─── race ──────────────────────┐     │
-   │   │  reauth timer (Visa: 4d, etc) │ →  reauthorize  → loop
-   │   │  capture signal               │ →  capture      → done
-   │   │  cancel signal                │ →  cancel       → done
-   │   │  reauthorize signal (admin)   │ →  reauthorize  → loop
-   │   │  revise signal                │ →  re-amount    → loop
-   │   └───────────────────────────────┘     │
-   │                                         │
-   └─────────────────────────────────────────┘
-                    │
-            ┌───────▼────────┐
-            │ your activities│ — you implement persistContext + 4 lifecycle hooks
-            └────────────────┘
+```mermaid
+flowchart LR
+    A[order placed] --> B[stripeOrderWorkflow]
+    B --> R{race}
+    R -->|reauth timer fires| RA[reauthorize]
+    R -->|capture signal| C[capture]
+    R -->|cancel signal| X[cancel]
+    R -->|reauthorize signal admin| RA
+    R -->|revise signal| RV[re-amount]
+    RA --> B
+    RV --> B
+    C --> D[done — captured]
+    X --> E[done — canceled]
+    C --> F[stripeRefundWorkflow]
+    F --> G[refunds + disputes 60–120d]
 ```
 
 The library never assumes a DB schema. You provide `persistContext(ctx)` and the lifecycle hooks (`onReauthorized`, `onCaptured`, `onCanceled`, `onFailure`); the workflow calls them at the right moments.
 
-### Signal reference
+---
+
+## Signals
+
+<details>
+<summary><b>stripeOrderWorkflow</b> — capture, multicapture, cancel, reauthorize, revise</summary>
 
 | Signal | Payload | What it does |
 |---|---|---|
@@ -76,9 +104,14 @@ The library never assumes a DB schema. You provide `persistContext(ctx)` and the
 
 If multiple signals are pending in the same workflow tick, priority is **cancel > revise > admin reauth > multicapture > capture**. That way a "drop the price *then* capture" sequence sent in quick succession lands at the new amount.
 
-### Refund workflow signals
+</details>
 
-Run `stripeRefundWorkflow` per captured PI for the long-tail refund and chargeback path. Lives separately so the order workflow can terminate cleanly at capture while this one keeps listening through the chargeback window (60-120 days).
+## Refund + dispute workflow
+
+<details>
+<summary><b>stripeRefundWorkflow</b> — refunds + disputes (60–120 day window)</summary>
+
+Run `stripeRefundWorkflow` per captured PI for the long-tail refund and chargeback path. Lives separately so the order workflow can terminate cleanly at capture while this one keeps listening through the chargeback window.
 
 | Signal | Payload | What it does |
 |---|---|---|
@@ -86,7 +119,12 @@ Run `stripeRefundWorkflow` per captured PI for the long-tail refund and chargeba
 | `disputeOpened` | `{ disputeId, amountCents, reason? }` | A Stripe dispute landed. Workflow flips to `disputed`; further refund signals are short-circuited (Stripe rejects them anyway). |
 | `disputeClosed` | `{ disputeId, status }` | Dispute resolved (won / lost / warning_closed). Workflow flips to `dispute_closed` and is eligible to take more refunds again. |
 
-### Activity contract
+</details>
+
+## Activity contract
+
+<details>
+<summary><b>Activity interfaces</b> — the surface you implement (or let the helper implement for you)</summary>
 
 ```ts
 interface StripeOrderActivities {
@@ -116,7 +154,12 @@ interface StripeRefundActivities {
 
 `makeStripeActivities(stripe, opts)` returns a ready-to-go implementation of every method against the official `stripe` SDK. You only need to supply `persistContext` (and any hooks you care about); everything Stripe-related is wired for you. A companion `makeStripeRefundActivities(stripe, opts)` does the same for the refund workflow.
 
-### Saga primitive
+</details>
+
+## Saga primitive
+
+<details>
+<summary><b>runSagaStep + SagaRegistry</b> — compensations for irreversible Stripe call chains</summary>
 
 `runSagaStep` + `SagaRegistry` are exported for workflows that chain irreversible Stripe calls (e.g. reauth = tag-cancel-old + create-new). Compensation closures run LIFO on failure; individual compensation errors are logged not thrown so cleanup is best-effort.
 
@@ -142,7 +185,12 @@ try {
 
 The reauth flow already uses this internally; the primitive is exported so consumers can wrap their own multi-step Stripe sequences (e.g. transfer + payout, Connect onboarding).
 
-### Per-issuer expiry overrides
+</details>
+
+## Per-issuer expiry overrides
+
+<details>
+<summary><b>brandExpiryOverrides</b> — tune the reauth window for regional issuers (JCB, UnionPay)</summary>
 
 Pass `brandExpiryOverrides` on the workflow args to tune the reauth window for region-specific issuers. Keys are lowercased card brands; values are milliseconds from `authCreatedAt`. `captureBefore` (extended auth) still wins; otherwise the caller override beats the package default beats `REAUTH_WINDOW_MS.default`.
 
@@ -155,6 +203,8 @@ args: [{
   },
 }]
 ```
+
+</details>
 
 ---
 
@@ -252,7 +302,18 @@ A fully runnable demo lives in [`examples/basic`](./examples/basic).
 
 v1.0. PaymentIntent lifecycle (capture/cancel/reauth/revise/multicapture), refund + dispute workflow, saga primitive and per-issuer expiry overrides are all GA. Subsequent versions follow semantic-release conventions.
 
-See [PLAN.md](./PLAN.md) for the full architecture + phase roadmap.
+<details>
+<summary><b>What's intentionally out of scope</b> — non-goals for v1</summary>
+
+- No payment-method tokenization (Stripe handles that).
+- No fraud rules engine — consumers attach their own `runInitialFraudCheck` activity.
+- No subscription/recurring-charge support (those don't use manual capture the same way).
+- No UI components — this is a workflow library.
+- No support for `capture_method: 'automatic'` orders — they don't need reauth.
+- No multi-currency conversion logic — pass the right currency in.
+- No alternative payment processors — Stripe Connect only.
+
+</details>
 
 ## Changelog
 
@@ -281,4 +342,4 @@ pnpm test        # 60 tests across both packages
 
 ## License
 
-MIT.
+MIT · [@mateokadiu](https://github.com/mateokadiu)
