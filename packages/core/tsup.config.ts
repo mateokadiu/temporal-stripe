@@ -7,6 +7,9 @@ export default defineConfig({
     'activities/index': 'src/activities/index.ts',
   },
   format: ['esm', 'cjs'],
+  // Force explicit extensions so package.json `exports` can pin `.mjs` / `.cjs`
+  // independent of the consumer's `type: module` interpretation.
+  outExtension: ({ format }) => ({ js: format === 'esm' ? '.mjs' : '.cjs' }),
   dts: true,
   clean: true,
   sourcemap: true,
